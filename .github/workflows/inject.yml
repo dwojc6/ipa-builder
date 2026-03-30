@@ -1,77 +1,117 @@
 name: Inject IPA
+run-name: Inject ${{ inputs.app_name }} v${{ inputs.version }}
 
 on:
   workflow_dispatch:
     inputs:
       app_name:
+        description: "Display name for the app"
         required: true
-
+        type: string
       version:
+        description: "App version being processed"
         required: true
-
+        type: string
       bundle_id:
+        description: "Bundle identifier for the app"
         required: true
+        type: string
+      source_release_tag:
+        description: "Temporary release tag holding the decrypted IPA"
+        required: true
+        type: string
+      ipa_asset_name:
+        description: "Decrypted IPA asset name in the temporary release"
+        required: true
+        type: string
+      cyan_asset_name:
+        description: ".cyan profile asset name in the temporary release"
+        required: true
+        type: string
+      release_tag:
+        description: "Final GitHub release tag for the injected IPA"
+        required: true
+        type: string
+      release_name:
+        description: "Final GitHub release title"
+        required: true
+        type: string
+      output_asset_name:
+        description: "Injected IPA filename"
+        required: true
+        type: string
 
-      cyan_profile:
-        required: true
+concurrency:
+  group: inject-${{ inputs.release_tag }}
+  cancel-in-progress: false
 
 jobs:
   inject:
-
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
 
     steps:
-
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Download IPA Artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: decrypted-ipa
-
-      - name: Install Dependencies
+      - name: Download source assets
         run: |
-          sudo apt update
-          sudo apt install -y wget unzip git
+          mkdir -p work build
+          gh release download "${{ inputs.source_release_tag }}" \
+            --pattern "${{ inputs.ipa_asset_name }}" \
+            --dir work
+          gh release download "${{ inputs.source_release_tag }}" \
+            --pattern "${{ inputs.cyan_asset_name }}" \
+            --dir work
 
-      - name: Install Cyan
+      - name: Validate downloaded IPA
         run: |
-          git clone https://github.com/asdfzxcvbn/cyan.git
-          cd cyan
-          chmod +x cyan
-          sudo mv cyan /usr/local/bin/
+          file_type=$(file --mime-type -b "work/${{ inputs.ipa_asset_name }}")
 
-      - name: Inject Tweaks
+          if [[ "$file_type" != "application/x-ios-app" && "$file_type" != "application/zip" ]]; then
+            echo "::error::Downloaded file is not a valid IPA. Detected type: $file_type"
+            exit 1
+          fi
+
+      - name: Install cyan
+        run: |
+          python3 -m pip install --user --upgrade \
+            https://github.com/asdfzxcvbn/pyzule-rw/archive/main.zip
+          echo "$(python3 -m site --user-base)/bin" >> "$GITHUB_PATH"
+
+      - name: Inject tweaks into IPA
         run: |
           cyan \
-            -i decrypted.ipa \
-            -o injected.ipa \
-            -c ${{ inputs.cyan_profile }} \
+            -i "work/${{ inputs.ipa_asset_name }}" \
+            -o "build/${{ inputs.output_asset_name }}" \
+            -z "work/${{ inputs.cyan_asset_name }}" \
             -n "${{ inputs.app_name }}" \
-            -b "${{ inputs.bundle_id }}"
+            -v "${{ inputs.version }}" \
+            -b "${{ inputs.bundle_id }}" \
+            --overwrite
 
-      - name: Create Tag
+      - name: Create or update injected release
         run: |
+          notes="Injected build for ${{ inputs.app_name }} ${{ inputs.version }}"
 
-          TAG="${{ inputs.app_name }}-v${{ inputs.version }}"
+          if gh release view "${{ inputs.release_tag }}" >/dev/null 2>&1; then
+            gh release edit "${{ inputs.release_tag }}" \
+              --title "${{ inputs.release_name }}" \
+              --notes "$notes"
+          else
+            gh release create "${{ inputs.release_tag }}" \
+              "build/${{ inputs.output_asset_name }}" \
+              --title "${{ inputs.release_name }}" \
+              --notes "$notes"
+            exit 0
+          fi
 
-          git config user.name "github-actions"
-          git config user.email "actions@github.com"
+          gh release upload "${{ inputs.release_tag }}" \
+            "build/${{ inputs.output_asset_name }}" \
+            --clobber
 
-          git tag "$TAG"
-          git push origin "$TAG"
-
-          echo "TAG=$TAG" >> $GITHUB_ENV
-
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ env.TAG }}
-          name: ${{ inputs.app_name }} v${{ inputs.version }}
-          files: injected.ipa
-
-      - name: Cleanup
+      - name: Delete temporary decrypted release
+        if: always()
         run: |
-          rm -f decrypted.ipa
-          rm -f injected.ipa
+          gh release delete "${{ inputs.source_release_tag }}" --cleanup-tag --yes || true
