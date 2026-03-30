@@ -1,0 +1,77 @@
+name: Inject IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_name:
+        required: true
+
+      version:
+        required: true
+
+      bundle_id:
+        required: true
+
+      cyan_profile:
+        required: true
+
+jobs:
+  inject:
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download IPA Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: decrypted-ipa
+
+      - name: Install Dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y wget unzip git
+
+      - name: Install Cyan
+        run: |
+          git clone https://github.com/asdfzxcvbn/cyan.git
+          cd cyan
+          chmod +x cyan
+          sudo mv cyan /usr/local/bin/
+
+      - name: Inject Tweaks
+        run: |
+          cyan \
+            -i decrypted.ipa \
+            -o injected.ipa \
+            -c ${{ inputs.cyan_profile }} \
+            -n "${{ inputs.app_name }}" \
+            -b "${{ inputs.bundle_id }}"
+
+      - name: Create Tag
+        run: |
+
+          TAG="${{ inputs.app_name }}-v${{ inputs.version }}"
+
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+
+          git tag "$TAG"
+          git push origin "$TAG"
+
+          echo "TAG=$TAG" >> $GITHUB_ENV
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: ${{ inputs.app_name }} v${{ inputs.version }}
+          files: injected.ipa
+
+      - name: Cleanup
+        run: |
+          rm -f decrypted.ipa
+          rm -f injected.ipa
