@@ -28,6 +28,10 @@ on:
         description: ".cyan profile asset name in the temporary release"
         required: true
         type: string
+      bundle_asset_name:
+        description: "Optional zipped .bundle asset name in the temporary release"
+        required: false
+        type: string
       release_tag:
         description: "Final GitHub release tag for the injected IPA"
         required: true
@@ -64,6 +68,11 @@ jobs:
           gh release download "${{ inputs.source_release_tag }}" \
             --pattern "${{ inputs.cyan_asset_name }}" \
             --dir work
+          if [ -n "${{ inputs.bundle_asset_name }}" ]; then
+            gh release download "${{ inputs.source_release_tag }}" \
+              --pattern "${{ inputs.bundle_asset_name }}" \
+              --dir work
+          fi
 
       - name: Validate downloaded IPA
         run: |
@@ -80,10 +89,45 @@ jobs:
             https://github.com/asdfzxcvbn/pyzule-rw/archive/main.zip
           echo "$(python3 -m site --user-base)/bin" >> "$GITHUB_PATH"
 
+      - name: Preload optional bundle
+        if: ${{ inputs.bundle_asset_name != '' }}
+        run: |
+          mkdir -p work/bundle
+          unzip -q "work/${{ inputs.bundle_asset_name }}" -d work/bundle
+          rm -rf work/payload_extract
+          unzip -q "work/${{ inputs.ipa_asset_name }}" -d work/payload_extract
+
+          app_dir=$(find work/payload_extract/Payload -maxdepth 1 -type d -name "*.app" | head -n 1)
+
+          if [ -z "$app_dir" ]; then
+            echo "::error::Could not locate .app folder in IPA payload"
+            exit 1
+          fi
+
+          bundle_dir=$(find work/bundle -maxdepth 1 -type d -name "*.bundle" | head -n 1)
+          if [ -z "$bundle_dir" ]; then
+            echo "::error::Downloaded bundle archive does not contain a .bundle directory"
+            exit 1
+          fi
+
+          rm -rf "$app_dir/$(basename "$bundle_dir")"
+          cp -R "$bundle_dir" "$app_dir/"
+
+          rm -f work/preloaded.ipa
+          (
+            cd work/payload_extract
+            zip -qr ../preloaded.ipa Payload
+          )
+
       - name: Inject tweaks into IPA
         run: |
+          input_ipa="work/${{ inputs.ipa_asset_name }}"
+          if [ -n "${{ inputs.bundle_asset_name }}" ]; then
+            input_ipa="work/preloaded.ipa"
+          fi
+
           cyan \
-            -i "work/${{ inputs.ipa_asset_name }}" \
+            -i "$input_ipa" \
             -o "build/${{ inputs.output_asset_name }}" \
             -z "work/${{ inputs.cyan_asset_name }}" \
             -n "${{ inputs.app_name }}" \
