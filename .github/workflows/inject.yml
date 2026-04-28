@@ -24,14 +24,6 @@ on:
         description: "Decrypted IPA asset name in the temporary release"
         required: true
         type: string
-      cyan_asset_name:
-        description: ".cyan profile asset name in the temporary release"
-        required: true
-        type: string
-      bundle_asset_name:
-        description: "Optional zipped .bundle asset name in the temporary release"
-        required: false
-        type: string
       release_tag:
         description: "Final GitHub release tag for the injected IPA"
         required: true
@@ -59,20 +51,15 @@ jobs:
       GH_REPO: ${{ github.repository }}
 
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Download source assets
         run: |
           mkdir -p work build
           gh release download "${{ inputs.source_release_tag }}" \
             --pattern "${{ inputs.ipa_asset_name }}" \
             --dir work
-          gh release download "${{ inputs.source_release_tag }}" \
-            --pattern "${{ inputs.cyan_asset_name }}" \
-            --dir work
-          if [ -n "${{ inputs.bundle_asset_name }}" ]; then
-            gh release download "${{ inputs.source_release_tag }}" \
-              --pattern "${{ inputs.bundle_asset_name }}" \
-              --dir work
-          fi
 
       - name: Validate downloaded IPA
         run: |
@@ -89,29 +76,124 @@ jobs:
             https://github.com/asdfzxcvbn/pyzule-rw/archive/main.zip
           echo "$(python3 -m site --user-base)/bin" >> "$GITHUB_PATH"
 
-      - name: Preload optional bundle
-        if: ${{ inputs.bundle_asset_name != '' }}
+      - name: Resolve app payload configuration
+        id: payloads
         run: |
-          mkdir -p work/bundle
-          unzip -q "work/${{ inputs.bundle_asset_name }}" -d work/bundle
           rm -rf work/payload_extract
           unzip -q "work/${{ inputs.ipa_asset_name }}" -d work/payload_extract
 
-          app_dir=$(find work/payload_extract/Payload -maxdepth 1 -type d -name "*.app" | head -n 1)
+          python3 <<'PY'
+          import os
+          import plistlib
+          import re
+          import sys
+          from pathlib import Path
 
-          if [ -z "$app_dir" ]; then
-            echo "::error::Could not locate .app folder in IPA payload"
-            exit 1
-          fi
+          payload_root = Path("work/payload_extract/Payload")
+          app_dirs = [path for path in payload_root.glob("*.app") if path.is_dir()]
+          if not app_dirs:
+              print("::error::Could not locate .app folder in IPA payload")
+              sys.exit(1)
 
-          bundle_dir=$(find work/bundle -maxdepth 1 -type d -name "*.bundle" | head -n 1)
-          if [ -z "$bundle_dir" ]; then
-            echo "::error::Downloaded bundle archive does not contain a .bundle directory"
-            exit 1
-          fi
+          app_dir = app_dirs[0]
+          info_path = app_dir / "Info.plist"
+          if not info_path.exists():
+              print(f"::error::Missing Info.plist in {app_dir}")
+              sys.exit(1)
 
-          rm -rf "$app_dir/$(basename "$bundle_dir")"
-          cp -R "$bundle_dir" "$app_dir/"
+          with info_path.open("rb") as handle:
+              info = plistlib.load(handle)
+
+          def normalize(value: str) -> str:
+              return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+          bundle_id = str(info.get("CFBundleIdentifier", "")).strip()
+          display_name = str(
+              info.get("CFBundleDisplayName")
+              or info.get("CFBundleName")
+              or app_dir.stem
+          ).strip()
+
+          candidate_values: list[str] = []
+          for value in (display_name, info.get("CFBundleName"), app_dir.stem, bundle_id):
+              if value:
+                  candidate_values.append(str(value))
+
+          candidates: list[str] = []
+          seen: set[str] = set()
+
+          def add_candidate(value: str) -> None:
+              normalized = normalize(value)
+              if normalized and normalized not in seen:
+                  seen.add(normalized)
+                  candidates.append(normalized)
+
+          for value in candidate_values:
+              add_candidate(value)
+              for token in re.split(r"[^A-Za-z0-9]+", value):
+                  if token:
+                      add_candidate(token)
+
+          for token in bundle_id.split("."):
+              if token:
+                  add_candidate(token)
+
+          debs_root = Path("debs")
+          if not debs_root.is_dir():
+              print("::error::Repository is missing the debs directory")
+              sys.exit(1)
+
+          payload_dirs = {
+              normalize(path.name): path
+              for path in debs_root.iterdir()
+              if path.is_dir()
+          }
+
+          matched_dir = None
+          for candidate in candidates:
+              if candidate in payload_dirs:
+                  matched_dir = payload_dirs[candidate]
+                  break
+
+          if matched_dir is None:
+              haystacks = [normalize(value) for value in candidate_values if value]
+              for key, path in payload_dirs.items():
+                  if any(key and key in haystack for haystack in haystacks):
+                      matched_dir = path
+                      break
+
+          if matched_dir is None:
+              available = ", ".join(sorted(path.name for path in payload_dirs.values())) or "(none)"
+              print(
+                  "::error::No matching deb payload folder found for "
+                  f"'{display_name}' ({bundle_id}). Available folders: {available}"
+              )
+              sys.exit(1)
+
+          bundle_dirs = sorted(path.name for path in matched_dir.glob("*.bundle") if path.is_dir())
+          print(f"Matched payload folder '{matched_dir.name}' for '{display_name}' ({bundle_id})")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              print(f"payload_dir={matched_dir.as_posix()}", file=output)
+              print(f"payload_key={matched_dir.name}", file=output)
+              print(f"detected_app_name={display_name}", file=output)
+              print(f"detected_bundle_id={bundle_id}", file=output)
+              print(f"app_dir={app_dir.as_posix()}", file=output)
+              print(f"has_bundles={'true' if bundle_dirs else 'false'}", file=output)
+          PY
+
+      - name: Preload repo bundle assets
+        if: ${{ steps.payloads.outputs.has_bundles == 'true' }}
+        run: |
+          app_dir="${{ steps.payloads.outputs.app_dir }}"
+          payload_dir="${{ steps.payloads.outputs.payload_dir }}"
+
+          shopt -s nullglob
+          for bundle_dir in "$payload_dir"/*.bundle; do
+            bundle_name=$(basename "$bundle_dir")
+            rm -rf "$app_dir/$bundle_name"
+            cp -R "$bundle_dir" "$app_dir/"
+          done
 
           rm -f work/preloaded.ipa
           (
@@ -122,14 +204,29 @@ jobs:
       - name: Inject tweaks into IPA
         run: |
           input_ipa="work/${{ inputs.ipa_asset_name }}"
-          if [ -n "${{ inputs.bundle_asset_name }}" ]; then
+          if [ -f "work/preloaded.ipa" ]; then
             input_ipa="work/preloaded.ipa"
           fi
+
+          payload_dir="${{ steps.payloads.outputs.payload_dir }}"
+          shopt -s nullglob
+          tweaks=()
+          for file in "$payload_dir"/*.deb "$payload_dir"/*.dylib; do
+            [ -f "$file" ] && tweaks+=("$file")
+          done
+
+          if [ ${#tweaks[@]} -eq 0 ]; then
+            echo "::error::No .deb or .dylib files found in $payload_dir"
+            exit 1
+          fi
+
+          echo "Injecting payload folder: ${{ steps.payloads.outputs.payload_key }}"
+          printf ' - %s\n' "${tweaks[@]}"
 
           cyan \
             -i "$input_ipa" \
             -o "build/${{ inputs.output_asset_name }}" \
-            -z "work/${{ inputs.cyan_asset_name }}" \
+            -uwef "${tweaks[@]}" \
             -n "${{ inputs.app_name }}" \
             -v "${{ inputs.version }}" \
             -b "${{ inputs.bundle_id }}" \
